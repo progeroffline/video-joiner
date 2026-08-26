@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+*.log
+.env
+
+# Медиафайлы не должны попадать в репозиторий
+*.mp4
+*.mov
+*.mkv
+*.ts
+*.m4v
+*.webm
