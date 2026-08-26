@@ -234,12 +234,29 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
     return [marker for marker in DTS_WARNING_MARKERS if marker in stderr_output]
 
 
+def collect_files(files: list[Path]) -> list[Path]:
+    """Если передан один аргумент и это директория — берёт из неё все .mp4 в алфавитном порядке."""
+    if len(files) == 1 and files[0].is_dir():
+        directory = files[0]
+        found = sorted(directory.glob("*.mp4"))
+        if not found:
+            console.print(f"[red]Ошибка:[/red] в директории {directory} не найдено файлов .mp4")
+            sys.exit(1)
+        return found
+    return files
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="video-joiner",
         description="Объединяет несколько последовательных частей видео в один файл без перекодирования.",
     )
-    parser.add_argument("files", nargs="+", type=Path, help="Файлы частей видео в порядке склейки")
+    parser.add_argument(
+        "files",
+        nargs="+",
+        type=Path,
+        help="Файлы частей видео в порядке склейки, либо одна директория с файлами .mp4",
+    )
     parser.add_argument("-o", "--output", type=Path, required=True, help="Путь к итоговому файлу")
     parser.add_argument("--force", action="store_true", help="Перезаписать output, если он уже существует")
     parser.add_argument("--verbose", action="store_true", help="Подробный вывод логов")
@@ -254,6 +271,8 @@ def main() -> None:
     logger.add(sys.stderr, level="DEBUG" if args.verbose else "WARNING")
 
     check_dependencies()
+
+    args.files = collect_files(args.files)
 
     for file in args.files:
         if not file.exists():
