@@ -157,8 +157,6 @@ def check_compatibility(infos: list[MediaInfo]) -> list[str]:
                 f"{info.path.name}: другое разрешение "
                 f"({info.width}x{info.height} != {first.width}x{first.height})"
             )
-        if abs(info.fps - first.fps) > 0.05:
-            problems.append(f"{info.path.name}: другой FPS ({info.fps} != {first.fps})")
         if info.audio_codec != first.audio_codec:
             problems.append(
                 f"{info.path.name}: другой аудиокодек ({info.audio_codec} != {first.audio_codec})"

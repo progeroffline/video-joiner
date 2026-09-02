@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import creation_time, discover_jobs
+from main import MediaInfo, check_compatibility, creation_time, discover_jobs
 
 
 class DiscoverJobsTests(unittest.TestCase):
@@ -48,6 +48,36 @@ class DiscoverJobsTests(unittest.TestCase):
     def test_creation_time_returns_a_number(self) -> None:
         with tempfile.NamedTemporaryFile() as file:
             self.assertIsInstance(creation_time(Path(file.name)), float)
+
+
+class CompatibilityTests(unittest.TestCase):
+    def test_average_fps_difference_does_not_block_merge(self) -> None:
+        first = MediaInfo(
+            path=Path("1.mp4"),
+            video_codec="h264",
+            width=1920,
+            height=1080,
+            fps=57.455,
+            audio_codec="aac",
+            sample_rate=48000,
+            channels=2,
+            duration=60.0,
+            size=1,
+        )
+        second = MediaInfo(
+            path=Path("2.mp4"),
+            video_codec="h264",
+            width=1920,
+            height=1080,
+            fps=60.0,
+            audio_codec="aac",
+            sample_rate=48000,
+            channels=2,
+            duration=60.0,
+            size=1,
+        )
+
+        self.assertEqual(check_compatibility([first, second]), [])
 
 
 if __name__ == "__main__":
