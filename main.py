@@ -19,8 +19,6 @@ from rich.table import Table
 
 console = Console()
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".ts", ".m4v", ".webm"}
-
 # Сообщения FFmpeg, указывающие на проблемы с таймстампами при склейке.
 DTS_WARNING_MARKERS = (
     "Non-monotonous DTS",
@@ -41,6 +39,16 @@ class MediaInfo:
     channels: int
     duration: float
     size: int
+
+
+@dataclass
+class MergeJob:
+    directory: Path
+    files: list[Path]
+
+    @property
+    def output(self) -> Path:
+        return self.directory / "video.mp4"
 
 
 def check_dependencies() -> None:
@@ -194,8 +202,12 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
     logger.debug("Команда FFmpeg: {}", cmd)
 
     process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+    ffmpeg_output = []
 
     with Progress(
         TextColumn("[bold]Объединение видео"),
@@ -208,8 +220,9 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
     ) as progress:
         task = progress.add_task("merge", total=100)
         assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
+        for raw_line in process.stdout:
+            ffmpeg_output.append(raw_line)
+            line = raw_line.strip()
             if "=" not in line:
                 continue
             key, _, value = line.partition("=")
@@ -223,42 +236,59 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
             elif key == "progress" and value == "end":
                 progress.update(task, completed=100)
 
-    stderr_output = process.stderr.read() if process.stderr else ""
     process.wait()
-    logger.debug("stderr FFmpeg:\n{}", stderr_output)
+    combined_output = "".join(ffmpeg_output)
+    logger.debug("Вывод FFmpeg:\n{}", combined_output)
 
     if process.returncode != 0:
-        logger.error("FFmpeg завершился с ошибкой:\n{}", stderr_output)
+        logger.error("FFmpeg завершился с ошибкой:\n{}", combined_output)
         raise RuntimeError("FFmpeg завершился с ошибкой, подробности в логе (--verbose)")
 
-    return [marker for marker in DTS_WARNING_MARKERS if marker in stderr_output]
+    return [marker for marker in DTS_WARNING_MARKERS if marker in combined_output]
 
 
-def collect_files(files: list[Path]) -> list[Path]:
-    """Если передан один аргумент и это директория — берёт из неё все .mp4 в алфавитном порядке."""
-    if len(files) == 1 and files[0].is_dir():
-        directory = files[0]
-        found = sorted(directory.glob("*.mp4"))
-        if not found:
-            console.print(f"[red]Ошибка:[/red] в директории {directory} не найдено файлов .mp4")
-            sys.exit(1)
-        return found
-    return files
+def creation_time(path: Path) -> float:
+    """Возвращает время создания файла или ctime, если birth time недоступен."""
+    stat = path.stat()
+    return getattr(stat, "st_birthtime", stat.st_ctime)
+
+
+def discover_jobs(root: Path) -> list[MergeJob]:
+    """Находит во всём дереве каталоги с исходными MP4-файлами."""
+    directories = [root, *(path for path in root.rglob("*") if path.is_dir())]
+    jobs = []
+    for directory in sorted(directories, key=lambda path: str(path).casefold()):
+        files = [
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and path.suffix.lower() == ".mp4"
+            and path.name.casefold() != "video.mp4"
+        ]
+        if files:
+            files.sort(key=lambda path: (creation_time(path), path.name.casefold()))
+            jobs.append(MergeJob(directory=directory, files=files))
+    return jobs
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="video-joiner",
-        description="Объединяет несколько последовательных частей видео в один файл без перекодирования.",
+        description=(
+            "Рекурсивно объединяет MP4-файлы в каждой директории "
+            "в локальный video.mp4 без перекодирования."
+        ),
     )
     parser.add_argument(
-        "files",
-        nargs="+",
+        "directory",
         type=Path,
-        help="Файлы частей видео в порядке склейки, либо одна директория с файлами .mp4",
+        help="Корневая директория для рекурсивного поиска файлов .mp4",
     )
-    parser.add_argument("-o", "--output", type=Path, required=True, help="Путь к итоговому файлу")
-    parser.add_argument("--force", action="store_true", help="Перезаписать output, если он уже существует")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Перезаписать существующие video.mp4",
+    )
     parser.add_argument("--verbose", action="store_true", help="Подробный вывод логов")
     parser.add_argument("--dry-run", action="store_true", help="Только проверка файлов, без объединения")
     return parser.parse_args()
@@ -272,71 +302,85 @@ def main() -> None:
 
     check_dependencies()
 
-    args.files = collect_files(args.files)
-
-    for file in args.files:
-        if not file.exists():
-            console.print(f"[red]Ошибка:[/red] файл не найден: {file}")
-            sys.exit(1)
-        if file.suffix.lower() not in VIDEO_EXTENSIONS:
-            logger.warning("Неизвестное расширение файла: {}", file)
-
-    if args.output.exists() and not args.force:
-        console.print(
-            f"[red]Ошибка:[/red] файл {args.output} уже существует. "
-            "Используйте --force для перезаписи."
-        )
+    if not args.directory.is_dir():
+        console.print(f"[red]Ошибка:[/red] директория не найдена: {args.directory}")
         sys.exit(1)
 
-    console.print("[bold]Проверка частей видео...[/bold]")
-    infos = [probe_file(f) for f in args.files]
-    show_table(infos)
-
-    problems = check_compatibility(infos)
-    if problems:
+    jobs = discover_jobs(args.directory)
+    if not jobs:
         console.print(
-            "[red]Части видео несовместимы, объединение через -c copy небезопасно:[/red]"
+            f"[yellow]В директории {args.directory} и её поддиректориях "
+            "не найдено исходных файлов .mp4[/yellow]"
         )
-        for problem in problems:
-            console.print(f"  - {problem}")
-        console.print(
-            "Автоматическая перекодировка не выполняется. "
-            "Приведите части к одинаковым параметрам и повторите попытку."
-        )
-        sys.exit(1)
-
-    total_duration = sum(info.duration for info in infos)
-
-    if args.dry_run:
-        console.print("[yellow]Режим --dry-run: объединение не выполняется[/yellow]")
-        console.print(f"Файлы совместимы. Ожидаемая длительность: {format_duration(total_duration)}")
-        console.print(f"Результат будет сохранён в: {args.output}")
         return
 
-    concat_file = build_concat_file(args.files)
-    start = time.monotonic()
-    try:
-        warnings_found = run_ffmpeg_concat(concat_file, args.output, total_duration)
-    finally:
-        concat_file.unlink(missing_ok=True)
-    elapsed = time.monotonic() - start
+    existing_outputs = [job.output for job in jobs if job.output.exists()]
+    if existing_outputs and not args.force and not args.dry_run:
+        console.print("[red]Ошибка:[/red] уже существуют итоговые файлы:")
+        for output in existing_outputs:
+            console.print(f"  - {output}")
+        console.print("Используйте --force для перезаписи.")
+        sys.exit(1)
 
-    if warnings_found:
+    console.print(f"[bold]Найдено директорий для обработки: {len(jobs)}[/bold]")
+    prepared_jobs: list[tuple[MergeJob, list[MediaInfo], float]] = []
+    has_problems = False
+    for job in jobs:
+        console.print(f"\n[bold cyan]{job.directory}[/bold cyan]")
+        infos = [probe_file(file) for file in job.files]
+        show_table(infos)
+        problems = check_compatibility(infos)
+        if problems:
+            has_problems = True
+            console.print("[red]Несовместимые части:[/red]")
+            for problem in problems:
+                console.print(f"  - {problem}")
+        prepared_jobs.append((job, infos, sum(info.duration for info in infos)))
+
+    if has_problems:
         console.print(
-            f"[yellow]Предупреждение:[/yellow] FFmpeg сообщил о проблемах с таймстампами "
-            f"({', '.join(warnings_found)}). Результат стоит проверить вручную."
+            "\n[red]Объединение отменено.[/red] Приведите перечисленные части "
+            "к одинаковым параметрам и повторите попытку."
+        )
+        sys.exit(1)
+
+    if args.dry_run:
+        console.print("\n[yellow]Режим --dry-run: объединение не выполняется[/yellow]")
+        for job, _, total_duration in prepared_jobs:
+            console.print(
+                f"{job.output}: {len(job.files)} файлов, "
+                f"ожидаемая длительность {format_duration(total_duration)}"
+            )
+        return
+
+    started_at = time.monotonic()
+    for index, (job, _, total_duration) in enumerate(prepared_jobs, start=1):
+        console.print(f"\n[bold]Директория {index}/{len(prepared_jobs)}: {job.directory}[/bold]")
+        concat_file = build_concat_file(job.files)
+        try:
+            warnings_found = run_ffmpeg_concat(concat_file, job.output, total_duration)
+        finally:
+            concat_file.unlink(missing_ok=True)
+
+        if warnings_found:
+            console.print(
+                f"[yellow]Предупреждение:[/yellow] FFmpeg сообщил о проблемах с таймстампами "
+                f"({', '.join(warnings_found)}). Файл {job.output} стоит проверить вручную."
+            )
+
+        result_info = probe_file(job.output)
+        console.print(
+            f"[green]Создан {job.output}[/green] — {format_duration(result_info.duration)}, "
+            f"{format_size(result_info.size)}"
         )
 
-    result_info = probe_file(args.output)
-
+    elapsed = time.monotonic() - started_at
     console.print()
     console.print("[bold green]Готово[/bold green]")
-    console.print(f"Файлов:        {len(args.files)}")
-    console.print(f"Длительность:  {format_duration(result_info.duration)}")
-    console.print(f"Размер:        {format_size(result_info.size)}")
-    console.print("Перекодировка: нет")
-    console.print(f"Результат:     {args.output}")
-    console.print(f"Время работы:  {format_duration(elapsed)}")
+    console.print(f"Обработано директорий: {len(prepared_jobs)}")
+    console.print(f"Создано файлов:        {len(prepared_jobs)}")
+    console.print("Перекодировка:         нет")
+    console.print(f"Время работы:          {format_duration(elapsed)}")
 
 
 if __name__ == "__main__":
