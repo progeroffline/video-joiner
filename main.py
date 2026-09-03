@@ -269,6 +269,15 @@ def discover_jobs(root: Path) -> list[MergeJob]:
     return jobs
 
 
+def select_jobs(jobs: list[MergeJob], force: bool) -> tuple[list[MergeJob], list[MergeJob]]:
+    """Отделяет задания с готовым video.mp4, если перезапись не запрошена."""
+    if force:
+        return jobs, []
+    pending = [job for job in jobs if not job.output.exists()]
+    skipped = [job for job in jobs if job.output.exists()]
+    return pending, skipped
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="video-joiner",
@@ -312,13 +321,15 @@ def main() -> None:
         )
         return
 
-    existing_outputs = [job.output for job in jobs if job.output.exists()]
-    if existing_outputs and not args.force and not args.dry_run:
-        console.print("[red]Ошибка:[/red] уже существуют итоговые файлы:")
-        for output in existing_outputs:
-            console.print(f"  - {output}")
-        console.print("Используйте --force для перезаписи.")
-        sys.exit(1)
+    jobs, skipped_jobs = select_jobs(jobs, args.force)
+    if skipped_jobs:
+        console.print("[yellow]Пропущены директории с готовым video.mp4:[/yellow]")
+        for job in skipped_jobs:
+            console.print(f"  - {job.directory}")
+
+    if not jobs:
+        console.print("[green]Все найденные директории уже обработаны.[/green]")
+        return
 
     console.print(f"[bold]Найдено директорий для обработки: {len(jobs)}[/bold]")
     prepared_jobs: list[tuple[MergeJob, list[MediaInfo], float]] = []
@@ -376,6 +387,7 @@ def main() -> None:
     console.print()
     console.print("[bold green]Готово[/bold green]")
     console.print(f"Обработано директорий: {len(prepared_jobs)}")
+    console.print(f"Пропущено директорий:  {len(skipped_jobs)}")
     console.print(f"Создано файлов:        {len(prepared_jobs)}")
     console.print("Перекодировка:         нет")
     console.print(f"Время работы:          {format_duration(elapsed)}")

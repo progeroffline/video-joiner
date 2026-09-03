@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import MediaInfo, check_compatibility, creation_time, discover_jobs
+from main import MediaInfo, check_compatibility, creation_time, discover_jobs, select_jobs
 
 
 class DiscoverJobsTests(unittest.TestCase):
@@ -78,6 +78,34 @@ class CompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(check_compatibility([first, second]), [])
+
+
+class SelectJobsTests(unittest.TestCase):
+    def test_skips_directory_with_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "part.mp4"
+            output = root / "video.mp4"
+            source.touch()
+            output.touch()
+            jobs = discover_jobs(root)
+
+            pending, skipped = select_jobs(jobs, force=False)
+
+            self.assertEqual(pending, [])
+            self.assertEqual(skipped, jobs)
+
+    def test_force_includes_directory_with_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "part.mp4").touch()
+            (root / "video.mp4").touch()
+            jobs = discover_jobs(root)
+
+            pending, skipped = select_jobs(jobs, force=True)
+
+            self.assertEqual(pending, jobs)
+            self.assertEqual(skipped, [])
 
 
 if __name__ == "__main__":
