@@ -278,6 +278,18 @@ def select_jobs(jobs: list[MergeJob], force: bool) -> tuple[list[MergeJob], list
     return pending, skipped
 
 
+def delete_sources(files: list[Path]) -> int:
+    """Удаляет исходные MP4-файлы после проверки итогового video.mp4."""
+    if any(file.name.casefold() == "video.mp4" for file in files):
+        raise ValueError("Итоговый video.mp4 не может быть удалён как исходник")
+    deleted = 0
+    for file in files:
+        file.unlink()
+        logger.debug("Удалён исходный файл: {}", file)
+        deleted += 1
+    return deleted
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="video-joiner",
@@ -295,6 +307,11 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Перезаписать существующие video.mp4",
+    )
+    parser.add_argument(
+        "--keep-sources",
+        action="store_true",
+        help="Не удалять исходные MP4 после успешного объединения",
     )
     parser.add_argument("--verbose", action="store_true", help="Подробный вывод логов")
     parser.add_argument("--dry-run", action="store_true", help="Только проверка файлов, без объединения")
@@ -323,15 +340,16 @@ def main() -> None:
 
     jobs, skipped_jobs = select_jobs(jobs, args.force)
     if skipped_jobs:
-        console.print("[yellow]Пропущены директории с готовым video.mp4:[/yellow]")
+        console.print("[yellow]Найдены директории с готовым video.mp4:[/yellow]")
         for job in skipped_jobs:
             console.print(f"  - {job.directory}")
 
-    if not jobs:
+    if not jobs and args.keep_sources:
         console.print("[green]Все найденные директории уже обработаны.[/green]")
         return
 
-    console.print(f"[bold]Найдено директорий для обработки: {len(jobs)}[/bold]")
+    if jobs:
+        console.print(f"[bold]Найдено директорий для объединения: {len(jobs)}[/bold]")
     prepared_jobs: list[tuple[MergeJob, list[MediaInfo], float]] = []
     has_problems = False
     for job in jobs:
@@ -360,9 +378,25 @@ def main() -> None:
                 f"{job.output}: {len(job.files)} файлов, "
                 f"ожидаемая длительность {format_duration(total_duration)}"
             )
+        if skipped_jobs and not args.keep_sources:
+            files_to_delete = sum(len(job.files) for job in skipped_jobs)
+            console.print(
+                f"После проверки готовых video.mp4 было бы удалено исходников: "
+                f"{files_to_delete}"
+            )
         return
 
     started_at = time.monotonic()
+    deleted_files = 0
+    if not args.keep_sources:
+        for job in skipped_jobs:
+            probe_file(job.output)
+            deleted = delete_sources(job.files)
+            deleted_files += deleted
+            console.print(
+                f"[green]Очищена {job.directory}[/green] — удалено исходников: {deleted}"
+            )
+
     for index, (job, _, total_duration) in enumerate(prepared_jobs, start=1):
         console.print(f"\n[bold]Директория {index}/{len(prepared_jobs)}: {job.directory}[/bold]")
         concat_file = build_concat_file(job.files)
@@ -378,17 +412,22 @@ def main() -> None:
             )
 
         result_info = probe_file(job.output)
+        deleted = 0
+        if not args.keep_sources:
+            deleted = delete_sources(job.files)
+            deleted_files += deleted
         console.print(
             f"[green]Создан {job.output}[/green] — {format_duration(result_info.duration)}, "
-            f"{format_size(result_info.size)}"
+            f"{format_size(result_info.size)}; удалено исходников: {deleted}"
         )
 
     elapsed = time.monotonic() - started_at
     console.print()
     console.print("[bold green]Готово[/bold green]")
     console.print(f"Обработано директорий: {len(prepared_jobs)}")
-    console.print(f"Пропущено директорий:  {len(skipped_jobs)}")
+    console.print(f"С готовым результатом: {len(skipped_jobs)}")
     console.print(f"Создано файлов:        {len(prepared_jobs)}")
+    console.print(f"Удалено исходников:    {deleted_files}")
     console.print("Перекодировка:         нет")
     console.print(f"Время работы:          {format_duration(elapsed)}")
 

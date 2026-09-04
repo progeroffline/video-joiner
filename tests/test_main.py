@@ -3,7 +3,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from main import MediaInfo, check_compatibility, creation_time, discover_jobs, select_jobs
+from main import (
+    MediaInfo,
+    check_compatibility,
+    creation_time,
+    delete_sources,
+    discover_jobs,
+    select_jobs,
+)
 
 
 class DiscoverJobsTests(unittest.TestCase):
@@ -106,6 +113,36 @@ class SelectJobsTests(unittest.TestCase):
 
             self.assertEqual(pending, jobs)
             self.assertEqual(skipped, [])
+
+
+class DeleteSourcesTests(unittest.TestCase):
+    def test_deletes_sources_and_preserves_output_and_other_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.mp4"
+            second = root / "second.MP4"
+            output = root / "video.mp4"
+            other = root / "notes.txt"
+            for path in (first, second, output, other):
+                path.touch()
+
+            deleted = delete_sources([first, second])
+
+            self.assertEqual(deleted, 2)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertTrue(output.exists())
+            self.assertTrue(other.exists())
+
+    def test_refuses_to_delete_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "video.mp4"
+            output.touch()
+
+            with self.assertRaises(ValueError):
+                delete_sources([output])
+
+            self.assertTrue(output.exists())
 
 
 if __name__ == "__main__":
