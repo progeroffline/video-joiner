@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from main import (
     MediaInfo,
+    build_ffmpeg_command,
     check_compatibility,
     creation_time,
     delete_sources,
@@ -85,6 +86,18 @@ class CompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(check_compatibility([first, second]), [])
+
+
+class FfmpegCommandTests(unittest.TestCase):
+    def test_maps_video_and_optional_audio_but_not_data_streams(self) -> None:
+        command = build_ffmpeg_command(Path("files.txt"), Path("video.mp4"))
+        mapped_streams = [
+            command[index + 1]
+            for index, argument in enumerate(command)
+            if argument == "-map"
+        ]
+
+        self.assertEqual(mapped_streams, ["0:v", "0:a?"])
 
 
 class SelectJobsTests(unittest.TestCase):

@@ -185,18 +185,24 @@ def build_concat_file(files: list[Path]) -> Path:
     return concat_path
 
 
-def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) -> list[str]:
-    """Запускает объединение и показывает прогресс через Rich. Возвращает найденные предупреждения о таймстампах."""
-    cmd = [
+def build_ffmpeg_command(concat_file: Path, output: Path) -> list[str]:
+    """Строит команду FFmpeg, исключая несовместимые служебные потоки."""
+    return [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
-        "-map", "0",
+        "-map", "0:v",
+        "-map", "0:a?",
         "-c", "copy",
         "-progress", "pipe:1",
         "-nostats",
         str(output),
     ]
+
+
+def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) -> list[str]:
+    """Запускает объединение и показывает прогресс через Rich. Возвращает найденные предупреждения о таймстампах."""
+    cmd = build_ffmpeg_command(concat_file, output)
     logger.debug("Команда FFmpeg: {}", cmd)
 
     process = subprocess.Popen(
