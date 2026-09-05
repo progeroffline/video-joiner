@@ -10,6 +10,8 @@ from main import (
     creation_time,
     delete_sources,
     discover_jobs,
+    requeue_invalid_outputs,
+    run_ffmpeg_concat,
     select_jobs,
 )
 
@@ -99,6 +101,30 @@ class FfmpegCommandTests(unittest.TestCase):
 
         self.assertEqual(mapped_streams, ["0:v", "0:a?"])
 
+    def test_audio_recovery_copies_video_and_transcodes_audio(self) -> None:
+        command = build_ffmpeg_command(
+            Path("files.txt"), Path("video.mp4"), transcode_audio=True
+        )
+
+        self.assertIn("+discardcorrupt+genpts", command)
+        self.assertIn("ignore_err", command)
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertEqual(command[command.index("-c:a") + 1], "aac")
+
+    def test_retries_with_audio_transcoding_after_aac_error(self) -> None:
+        attempts = [
+            (1, "ADTS error", ["Non-monotonic DTS"], True),
+            (0, "recovered", [], False),
+        ]
+        with patch("main.execute_ffmpeg", side_effect=attempts) as execute:
+            warnings, audio_transcoded = run_ffmpeg_concat(
+                Path("files.txt"), Path("video.mp4"), 60.0
+            )
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(warnings, ["Non-monotonic DTS"])
+        self.assertTrue(audio_transcoded)
+
 
 class SelectJobsTests(unittest.TestCase):
     def test_skips_directory_with_existing_output(self) -> None:
@@ -126,6 +152,37 @@ class SelectJobsTests(unittest.TestCase):
 
             self.assertEqual(pending, jobs)
             self.assertEqual(skipped, [])
+
+    def test_requeues_job_when_existing_output_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "part.mp4").touch()
+            (root / "video.mp4").touch()
+            jobs = discover_jobs(root)
+            pending, completed = select_jobs(jobs, force=False)
+
+            with patch("main.probe_file", side_effect=RuntimeError("moov atom not found")):
+                pending, completed, invalid = requeue_invalid_outputs(pending, completed)
+
+            self.assertEqual(pending, jobs)
+            self.assertEqual(completed, [])
+            self.assertEqual(invalid[0][0], jobs[0])
+            self.assertIn("moov atom not found", invalid[0][1])
+
+    def test_keeps_job_completed_when_existing_output_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "part.mp4").touch()
+            (root / "video.mp4").touch()
+            jobs = discover_jobs(root)
+            pending, completed = select_jobs(jobs, force=False)
+
+            with patch("main.probe_file", return_value=object()):
+                pending, completed, invalid = requeue_invalid_outputs(pending, completed)
+
+            self.assertEqual(pending, [])
+            self.assertEqual(completed, jobs)
+            self.assertEqual(invalid, [])
 
 
 class DeleteSourcesTests(unittest.TestCase):

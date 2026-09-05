@@ -1,7 +1,7 @@
 [project]
 name = "video-joiner"
 version = "0.1.0"
-description = "Простая CLI-утилита для объединения частей видео без перекодирования через FFmpeg."
+description = "CLI-утилита для объединения частей с копированием видео без перекодирования через FFmpeg."
 requires-python = ">=3.11"
 dependencies = [
     "rich>=13.7",

@@ -1,4 +1,4 @@
-"""CLI-утилита для объединения нескольких частей видео в один файл без перекодирования."""
+"""CLI-утилита для объединения частей с копированием видео без перекодирования."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,9 +22,15 @@ console = Console()
 
 # Сообщения FFmpeg, указывающие на проблемы с таймстампами при склейке.
 DTS_WARNING_MARKERS = (
+    "Non-monotonic DTS",
     "Non-monotonous DTS",
     "Non-monotonically increasing DTS",
     "Invalid DTS",
+)
+
+AAC_RECOVERY_MARKERS = (
+    "Error parsing ADTS frame header",
+    "Error applying bitstream filters to an output packet for stream",
 )
 
 
@@ -49,6 +56,10 @@ class MergeJob:
     @property
     def output(self) -> Path:
         return self.directory / "video.mp4"
+
+    @property
+    def review_marker(self) -> Path:
+        return self.directory / ".video-joiner-needs-review"
 
 
 def check_dependencies() -> None:
@@ -185,36 +196,50 @@ def build_concat_file(files: list[Path]) -> Path:
     return concat_path
 
 
-def build_ffmpeg_command(concat_file: Path, output: Path) -> list[str]:
+def build_ffmpeg_command(
+    concat_file: Path, output: Path, *, transcode_audio: bool = False
+) -> list[str]:
     """Строит команду FFmpeg, исключая несовместимые служебные потоки."""
-    return [
+    command = [
         "ffmpeg", "-y",
+    ]
+    if transcode_audio:
+        command.extend([
+            "-fflags", "+discardcorrupt+genpts",
+            "-err_detect", "ignore_err",
+        ])
+    command.extend([
         "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
         "-map", "0:v",
         "-map", "0:a?",
-        "-c", "copy",
-        "-progress", "pipe:1",
-        "-nostats",
-        str(output),
-    ]
+    ])
+    if transcode_audio:
+        command.extend(["-c:v", "copy", "-c:a", "aac"])
+    else:
+        command.extend(["-c", "copy"])
+    command.extend(["-progress", "pipe:1", "-nostats", str(output)])
+    return command
 
 
-def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) -> list[str]:
-    """Запускает объединение и показывает прогресс через Rich. Возвращает найденные предупреждения о таймстампах."""
-    cmd = build_ffmpeg_command(concat_file, output)
-    logger.debug("Команда FFmpeg: {}", cmd)
+def execute_ffmpeg(
+    command: list[str], total_duration: float, progress_label: str
+) -> tuple[int, str, list[str], bool]:
+    """Выполняет FFmpeg и возвращает код, хвост лога, DTS-предупреждения и признак AAC-ошибки."""
+    logger.debug("Команда FFmpeg: {}", command)
 
     process = subprocess.Popen(
-        cmd,
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
-    ffmpeg_output = []
+    ffmpeg_output: deque[str] = deque(maxlen=2000)
+    warnings_found: set[str] = set()
+    aac_recovery_needed = False
 
     with Progress(
-        TextColumn("[bold]Объединение видео"),
+        TextColumn(f"[bold]{progress_label}"),
         BarColumn(),
         TextColumn("{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
@@ -226,6 +251,11 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
         assert process.stdout is not None
         for raw_line in process.stdout:
             ffmpeg_output.append(raw_line)
+            warnings_found.update(
+                marker for marker in DTS_WARNING_MARKERS if marker in raw_line
+            )
+            if any(marker in raw_line for marker in AAC_RECOVERY_MARKERS):
+                aac_recovery_needed = True
             line = raw_line.strip()
             if "=" not in line:
                 continue
@@ -243,12 +273,47 @@ def run_ffmpeg_concat(concat_file: Path, output: Path, total_duration: float) ->
     process.wait()
     combined_output = "".join(ffmpeg_output)
     logger.debug("Вывод FFmpeg:\n{}", combined_output)
+    warnings = [marker for marker in DTS_WARNING_MARKERS if marker in warnings_found]
+    return process.returncode, combined_output, warnings, aac_recovery_needed
 
-    if process.returncode != 0:
-        logger.error("FFmpeg завершился с ошибкой:\n{}", combined_output)
-        raise RuntimeError("FFmpeg завершился с ошибкой, подробности в логе (--verbose)")
 
-    return [marker for marker in DTS_WARNING_MARKERS if marker in combined_output]
+def run_ffmpeg_concat(
+    concat_file: Path, output: Path, total_duration: float
+) -> tuple[list[str], bool]:
+    """Объединяет части, повторяя попытку с перекодированием повреждённого AAC."""
+    command = build_ffmpeg_command(concat_file, output)
+    returncode, ffmpeg_output, warnings, aac_recovery_needed = execute_ffmpeg(
+        command, total_duration, "Объединение видео"
+    )
+
+    if returncode == 0:
+        return warnings, False
+
+    if aac_recovery_needed:
+        console.print(
+            "[yellow]Обнаружен повреждённый AAC-пакет. Повторная попытка с "
+            "перекодированием только аудио...[/yellow]"
+        )
+        recovery_command = build_ffmpeg_command(
+            concat_file, output, transcode_audio=True
+        )
+        recovery_code, recovery_output, recovery_warnings, _ = execute_ffmpeg(
+            recovery_command, total_duration, "Восстановление аудио"
+        )
+        warnings = list(dict.fromkeys([*warnings, *recovery_warnings]))
+        if recovery_code == 0:
+            return warnings, True
+        logger.debug(
+            "FFmpeg завершился с ошибкой после повторной попытки:\n{}",
+            recovery_output,
+        )
+        raise RuntimeError(
+            "FFmpeg не смог объединить файлы даже после восстановления аудио; "
+            "исходники сохранены"
+        )
+
+    logger.debug("FFmpeg завершился с ошибкой:\n{}", ffmpeg_output)
+    raise RuntimeError("FFmpeg завершился с ошибкой, подробности в логе (--verbose)")
 
 
 def creation_time(path: Path) -> float:
@@ -284,6 +349,25 @@ def select_jobs(jobs: list[MergeJob], force: bool) -> tuple[list[MergeJob], list
     return pending, skipped
 
 
+def requeue_invalid_outputs(
+    pending: list[MergeJob], completed: list[MergeJob]
+) -> tuple[list[MergeJob], list[MergeJob], list[tuple[MergeJob, str]]]:
+    """Возвращает задания с повреждённым video.mp4 в очередь на пересборку."""
+    ready = []
+    invalid = []
+    pending = list(pending)
+    for job in completed:
+        try:
+            probe_file(job.output)
+        except RuntimeError as error:
+            pending.append(job)
+            invalid.append((job, str(error)))
+        else:
+            ready.append(job)
+    pending.sort(key=lambda job: str(job.directory).casefold())
+    return pending, ready, invalid
+
+
 def delete_sources(files: list[Path]) -> int:
     """Удаляет исходные MP4-файлы после проверки итогового video.mp4."""
     if any(file.name.casefold() == "video.mp4" for file in files):
@@ -301,7 +385,7 @@ def parse_args() -> argparse.Namespace:
         prog="video-joiner",
         description=(
             "Рекурсивно объединяет MP4-файлы в каждой директории "
-            "в локальный video.mp4 без перекодирования."
+            "в локальный video.mp4 без перекодирования видео."
         ),
     )
     parser.add_argument(
@@ -324,7 +408,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def run() -> None:
     args = parse_args()
 
     logger.remove()
@@ -345,6 +429,21 @@ def main() -> None:
         return
 
     jobs, skipped_jobs = select_jobs(jobs, args.force)
+    jobs, skipped_jobs, invalid_outputs = requeue_invalid_outputs(jobs, skipped_jobs)
+    if invalid_outputs:
+        console.print("[yellow]Повреждённые video.mp4 будут пересозданы:[/yellow]")
+        for job, error in invalid_outputs:
+            console.print(f"  - {job.output}")
+            logger.debug("Причина пересборки {}: {}", job.output, error)
+    review_jobs = [job for job in skipped_jobs if job.review_marker.exists()]
+    skipped_jobs = [job for job in skipped_jobs if not job.review_marker.exists()]
+    if review_jobs:
+        console.print(
+            "[yellow]Директории с предупреждениями DTS требуют ручной проверки; "
+            "исходники сохранены:[/yellow]"
+        )
+        for job in review_jobs:
+            console.print(f"  - {job.directory}")
     if skipped_jobs:
         console.print("[yellow]Найдены директории с готовым video.mp4:[/yellow]")
         for job in skipped_jobs:
@@ -394,6 +493,7 @@ def main() -> None:
 
     started_at = time.monotonic()
     deleted_files = 0
+    audio_transcoded_files = 0
     if not args.keep_sources:
         for job in skipped_jobs:
             probe_file(job.output)
@@ -407,24 +507,39 @@ def main() -> None:
         console.print(f"\n[bold]Директория {index}/{len(prepared_jobs)}: {job.directory}[/bold]")
         concat_file = build_concat_file(job.files)
         try:
-            warnings_found = run_ffmpeg_concat(concat_file, job.output, total_duration)
+            warnings_found, audio_transcoded = run_ffmpeg_concat(
+                concat_file, job.output, total_duration
+            )
         finally:
             concat_file.unlink(missing_ok=True)
 
+        if audio_transcoded:
+            audio_transcoded_files += 1
+
         if warnings_found:
+            job.review_marker.write_text(
+                "FFmpeg сообщил о проблемах с DTS. Проверьте video.mp4 вручную "
+                "перед удалением исходников.\n",
+                encoding="utf-8",
+            )
+            review_jobs.append(job)
             console.print(
                 f"[yellow]Предупреждение:[/yellow] FFmpeg сообщил о проблемах с таймстампами "
-                f"({', '.join(warnings_found)}). Файл {job.output} стоит проверить вручную."
+                f"({', '.join(warnings_found)}). Файл {job.output} стоит проверить вручную; "
+                "исходники будут сохранены."
             )
+        else:
+            job.review_marker.unlink(missing_ok=True)
 
         result_info = probe_file(job.output)
         deleted = 0
-        if not args.keep_sources:
+        if not args.keep_sources and not warnings_found:
             deleted = delete_sources(job.files)
             deleted_files += deleted
         console.print(
             f"[green]Создан {job.output}[/green] — {format_duration(result_info.duration)}, "
             f"{format_size(result_info.size)}; удалено исходников: {deleted}"
+            + ("; аудио восстановлено" if audio_transcoded else "")
         )
 
     elapsed = time.monotonic() - started_at
@@ -432,10 +547,20 @@ def main() -> None:
     console.print("[bold green]Готово[/bold green]")
     console.print(f"Обработано директорий: {len(prepared_jobs)}")
     console.print(f"С готовым результатом: {len(skipped_jobs)}")
+    console.print(f"Требуют проверки:       {len(review_jobs)}")
     console.print(f"Создано файлов:        {len(prepared_jobs)}")
     console.print(f"Удалено исходников:    {deleted_files}")
-    console.print("Перекодировка:         нет")
-    console.print(f"Время работы:          {format_duration(elapsed)}")
+    console.print(f"С восстановлением аудио: {audio_transcoded_files}")
+    console.print("Перекодировка видео:     нет")
+    console.print(f"Время работы:            {format_duration(elapsed)}")
+
+
+def main() -> None:
+    try:
+        run()
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        console.print(f"[red]Ошибка:[/red] {error}")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
